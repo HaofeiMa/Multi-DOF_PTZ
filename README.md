@@ -11,5 +11,6 @@ The project aims to achieve real-time tracking of doctors' surgical areas or pat
 
 # 3. Acknowledgements
 
-This project references the ideas of [https://github.com/bertinetto/staple](https://github.com/bertinetto/staple)
+This project references the ideas of:
+1. [https://github.com/bertinetto/staple](https://github.com/bertinetto/staple)
 
