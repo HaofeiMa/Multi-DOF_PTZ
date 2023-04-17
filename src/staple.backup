@@ -1,0 +1,242 @@
+/***************  库文件  ***************/
+// ROS库
+#include <ros/ros.h>                            //ROS标准库文件
+#include <image_transport/image_transport.h>	//用来在ROS系统中的话题上发布和订阅图像消息
+#include <cv_bridge/cv_bridge.h>		        //包含CvBridge库
+#include <sensor_msgs/image_encodings.h>	    //ROS图像类型的编码函数
+
+// C++标准库
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+
+// OpenCV库
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+// 自建库
+#include "staple_tracker.hpp"
+#include "linux_serial.h"
+
+/*************** 全局变量 ***************/
+// Staple全局变量
+bool drawing_box = false;
+cv::Rect groundtruth_rect;
+bool drawing_finished = false;
+// 串行通信变量
+double sendData1=400.0;
+double sendData2=300.0;
+unsigned char sendData3=0x07;
+double receiveData1=0.0;
+double receiveData2=0.0;
+double receiveData3=0.0;
+unsigned char receiveData4=0x00;
+// 数据定义
+STAPLE_TRACKER staple;  //创建staple跟踪对象
+std::vector<cv::Rect_<float>> result_rects;     //创建矩形容器，存储所有算法识别出的跟踪框
+//cv::VideoCapture capture(0);	//创建VideoCapture类
+cv::Mat image;      //用来存储每一帧
+cv::Mat tempImage;  //每一帧的临时变量
+int64 tic, toc;     //算法运行时间起始点与终止点
+//double time = 0;
+bool show_visualization = true;
+bool first_image = true;
+
+
+/*************** 函数声明 ***************/
+cv::Rect_<float> getAxisAlignedBB(std::vector<cv::Point2f> polygon);
+std::vector<cv::Rect_<float>> getgroundtruth(std::string txt_file);
+void on_MouseHandle(int event, int x, int y, int flags, void* param );
+void image_process(cv::Mat& image);
+void convert_callback(const sensor_msgs::ImageConstPtr& msg);
+
+
+
+/***************  主函数  ***************/
+int main(int argc, char** argv){
+    ros::init(argc, argv, "image_convert");
+    ros::NodeHandle n;                      //定义ROS句柄
+
+    //
+    image_transport::ImageTransport it(n);     //定义image_transport实例
+    image_transport::Subscriber image_sub;  //定义ROS图像接收器
+    image_transport::Publisher image_pub;   //定义ROS图像发布器
+
+    image_sub = it.subscribe("/usb_cam/image_raw", 30, convert_callback);   //定义图像接收器
+    image_pub = it.advertise("image_convert/output_video", 30);  //定义图像发布器
+    //cv::namedWindow("Image window");    //初始化输入输出窗口
+    cv::namedWindow("STAPLE");
+    cv::setMouseCallback("STAPLE", on_MouseHandle, (void*)&image);  // 设置鼠标操作回调函数
+    serialInit();   // 串口初始化
+
+    ros::spin();
+    cv::destroyWindow("STAPLE");
+    return 0;
+}
+
+
+/*************** 函数定义 ***************/
+// 使轴对齐
+cv::Rect_<float> getAxisAlignedBB(std::vector<cv::Point2f> polygon)
+{
+    double cx = double(polygon[0].x + polygon[1].x + polygon[2].x + polygon[3].x) / 4.;
+    double cy = double(polygon[0].y + polygon[1].y + polygon[2].y + polygon[3].y) / 4.;
+    double x1 = std::min(std::min(std::min(polygon[0].x, polygon[1].x), polygon[2].x), polygon[3].x);
+    double x2 = std::max(std::max(std::max(polygon[0].x, polygon[1].x), polygon[2].x), polygon[3].x);
+    double y1 = std::min(std::min(std::min(polygon[0].y, polygon[1].y), polygon[2].y), polygon[3].y);
+    double y2 = std::max(std::max(std::max(polygon[0].y, polygon[1].y), polygon[2].y), polygon[3].y);
+    double A1 = norm(polygon[1] - polygon[2])*norm(polygon[2] - polygon[3]);
+    double A2 = (x2 - x1) * (y2 - y1);
+    double s = sqrt(A1 / A2);
+    double w = s * (x2 - x1) + 1;
+    double h = s * (y2 - y1) + 1;
+    cv::Rect_<float> rect(cx-1-w/2.0, cy-1-h/2.0, w, h);
+    return rect;
+
+}
+// 获取groundtruth内的矩形坐标
+std::vector<cv::Rect_<float>> getgroundtruth(std::string txt_file)
+{
+    std::vector<cv::Rect_<float>> rects;
+    std::ifstream gt;
+    gt.open(txt_file.c_str());
+    if (!gt.is_open())
+        std::cout << "Ground truth file " << txt_file
+                  << " can not be read" << std::endl;
+    std::string line;
+    float x1, y1, x2, y2, x3, y3, x4, y4;
+    while (getline(gt, line)) {
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::stringstream ss;
+        ss.str(line);
+        ss >> x1 >> y1 >> x2 >> y2 >> x3 >> y3 >> x4 >> y4;
+        std::vector<cv::Point2f>polygon;
+        polygon.push_back(cv::Point2f(x1, y1));
+        polygon.push_back(cv::Point2f(x2, y2));
+        polygon.push_back(cv::Point2f(x3, y3));
+        polygon.push_back(cv::Point2f(x4, y4));
+        rects.push_back(getAxisAlignedBB(polygon)); //0-index
+    }
+    gt.close();
+    return rects;
+}
+// 第一帧画框鼠标响应
+void on_MouseHandle(int event, int x, int y, int flags, void* param ){
+    cv::Mat& image = *(cv::Mat*) param;
+    switch( event)
+    {
+        //鼠标移动消息
+        case cv::EVENT_MOUSEMOVE:
+        {
+            if( drawing_box )//如果是否进行绘制的标识符为真，则记录下长和宽到RECT型变量中
+            {
+                groundtruth_rect.width = x-groundtruth_rect.x;
+                groundtruth_rect.height = y-groundtruth_rect.y;
+            }
+        }
+            break;
+
+            //左键按下消息
+        case cv::EVENT_LBUTTONDOWN:
+        {
+            drawing_box = true;
+            groundtruth_rect = cv::Rect( x, y, 0, 0 );//记录起始点
+        }
+            break;
+
+            //左键抬起消息
+        case cv::EVENT_LBUTTONUP:
+        {
+            drawing_box = false;//置标识符为false
+            drawing_finished = true;
+            //对宽和高小于0的处理
+            if( groundtruth_rect.width < 0 )
+            {
+                groundtruth_rect.x += groundtruth_rect.width;
+                groundtruth_rect.width *= -1;
+            }
+
+            if( groundtruth_rect.height < 0 )
+            {
+                groundtruth_rect.y += groundtruth_rect.height;
+                groundtruth_rect.height *= -1;
+            }
+            //调用函数进行绘制
+            cv::rectangle(image,groundtruth_rect.tl(),groundtruth_rect.br(),cv::Scalar(0,0,255));// 画框
+        }
+            break;
+    }
+}
+//STAPLE图像处理函数
+void image_process(cv::Mat& image){
+    flip(image, image, 1);	//将读取的视频左右反转
+    if(drawing_finished == false){
+        // 鼠标按下drawing_box=true，在视频画面frame上画矩形
+        if( drawing_box ){
+            tempImage.copyTo(image);
+            cv::rectangle(image,groundtruth_rect.tl(),groundtruth_rect.br(),cv::Scalar(0,0,255));// 画框
+        }
+        else{
+            image.copyTo(tempImage);//拷贝源图到临时变量
+        }
+    }
+    else{
+        // 如果是第一帧图像,则进行staple初始化操作，反之则只更新staple
+        if (first_image){
+            // staple初始化操作
+            staple.tracker_staple_initialize(image, groundtruth_rect);
+            // staple目标追踪
+            staple.tracker_staple_train(image, true);
+            first_image = false;
+        } else{
+            groundtruth_rect = staple.tracker_staple_update(image);
+            staple.tracker_staple_train(image, false);
+        }
+    }
+    // 可视化部分
+    if (show_visualization) {
+        // 显示跟踪框的左上点坐标
+        //cv::putText(image, std::to_string(frame + 1), cv::Point(20, 40), 6, 1,
+        //            cv::Scalar(0, 255, 255), 2);
+        // 显示人工标定的跟踪框
+        //cv::rectangle(image, groundtruth_rect[frame], cv::Scalar(0, 255, 0), 2);
+        // 显示算法识别的跟踪框
+        cv::rectangle(image, groundtruth_rect, cv::Scalar(0, 128, 255), 2);
+
+        // 写入测试视频
+        // ******************** //
+        // video.write(image);
+        // ******************** //
+
+        // 输出图像显示结果
+        cv::imshow("STAPLE", image);
+        //std::cout << "Center: [" << groundtruth_rect.tl().x +groundtruth_rect.width/2 << ", " << groundtruth_rect.tl().y + groundtruth_rect.height/2 << "]" << std::endl;
+        sendData1 = groundtruth_rect.tl().x + groundtruth_rect.width/2;
+        sendData2 = groundtruth_rect.tl().y + groundtruth_rect.height/2;
+        writeSpeed(sendData1,sendData2,sendData3);
+        //readSpeed(receiveData1,receiveData2,receiveData3,receiveData4);
+        ROS_INFO("SendData:\t%f,%f,%d\n",sendData1,sendData2,sendData3);
+        ROS_INFO("ReceiveData:\t%f,%f,%f,%d\n",receiveData1,receiveData2,receiveData3,receiveData4);
+
+        char key = cv::waitKey(5);
+    }
+
+
+
+}
+//ROS与OpenCV格式转换回调函数，将图像格式从sensor_msgs/Image转换为cv::Mat
+void convert_callback(const sensor_msgs::ImageConstPtr& msg){
+    cv_bridge::CvImagePtr cv_ptr;   //声明一个CvImage指针的实例
+    try{
+        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);  //将ROS消息中图像信息提取，生成cv类型的图像，赋值给CvImage指针
+    }
+    catch(cv_bridge::Exception& e){
+        ROS_ERROR("cv_bridge exception: %s", e.what());
+        return;
+    }
+    image_process(cv_ptr->image);   //得到cv::Mat类型图像在CvImage指针的image中，将结果转送给处理函数
+    //image_pub.publish(cv_ptr->toImageMsg());    //发布图像显示
+}
+
