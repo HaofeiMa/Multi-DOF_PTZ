@@ -9,6 +9,8 @@ The project aims to achieve real-time tracking of doctors' surgical areas or pat
 
 ![Multi-DOF_PTZ_Models](https://user-images.githubusercontent.com/49356049/232426498-64889b17-eb87-48eb-a6a9-098501231ed4.gif)
 
+[![IMAGE ALT TEXT](http://img.youtube.com/vi/gDLijtdpC2w/0.jpg)](https://www.youtube.com/watch?v=gDLijtdpC2w Multi DOF PTZ Demo Video)
+
 # 3. Acknowledgements
 
 This project references the ideas of:
